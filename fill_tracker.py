@@ -1,50 +1,67 @@
 #!/usr/bin/env python3
 """Fill the Actions Tracker spreadsheet from MOE-format minutes of meeting (.docx).
 
-Deterministic: same inputs -> same output. No LLM.
+Deterministic: same inputs -> same strings. No LLM.
 
-Minutes template (per-file):
+Minutes (per .docx):
   - header table  : عنوان الاجتماع / التاريخ / الموقع ...
-  - attendees table : الجهة | الاسم
+  - attendees table : الجهة | الاسم  (used to spot هوّز team members)
   - "المطلوب" table : ملاحظات | الوقت المتوقع/المقترح للانتهاء | المسؤول | المهمة
 
-Each action row becomes a row in the tracker's 'سجل المهام' sheet, mapping:
-  المهمة  -> المهمة
-  المسؤول -> المسؤول
-  الوقت المتوقع للانتهاء -> تاريخ التسليم المستهدف + تاريخ المستهدف وفق المحضر
-  ملاحظات -> ملاحظات
-  meeting title + date -> الاجتماع / المصدر
-  (new) -> الحالة = لم تبدأ,  آخر تحديث = today
+Tracker ('سجل المهام', body row = B C D E F G H I J K M):
+  D المهمة                    <- المهمة
+  E المسؤول                   <- المسؤول
+  G تاريخ التسليم المستهدف     <- الوقت المتوقع للانتهاء
+  H الاجتماع / المصدر          <- "<عنوان الاجتماع> — <التاريخ>"
+  I ملاحظات                   <- ملاحظات
+  C المسؤول من الفريق          <- best-effort: a هوّز member name in the text,
+                                   else an entry from --owners mapping, else blank
+  F الحالة                    <- EMPTY unless --status given
+  M آخر تحديث                  <- today
+
+Formatting is preserved: the tracker is edited surgically at the XML level
+(no openpyxl round-trip), so the Excel Table (banding + filter), the الحالة
+dropdown data-validation, and every cell style survive untouched. The table
+range and dropdown range are extended to cover the new rows.
 
 Usage:
   python fill_tracker.py --tracker "Actions Tracker.xlsx" \
-      --minutes "3.3 Minutes of Meeting" [--out filled.xlsx] [--status "لم تبدأ"]
+      --minutes "3.3 Minutes of Meeting" [--out filled.xlsx]
+      [--status "لم تبدأ"] [--owners owners.json]
 """
 
 import argparse
 import datetime
+import json
 import os
+import re
+import shutil
 import sys
 import zipfile
 
 import docx
-from openpyxl import load_workbook
 from docx.oxml.ns import qn
 
-DEFAULT_STATUS = "لم تبدأ"              # status for newly added actions
-TRACKER_SHEET = "سجل المهام"            # sheet to fill
-DUE_MARKERS = ("انتهاء",)               # time field: الوقت المتوقع/المقترح للانتهاء
+# Tracker status is left EMPTY by default (user decides later via the dropdown).
+DEFAULT_STATUS = ""
+OWNERS_FILE = None
+
+# Cell layout of the tracker body rows (fixed template). Column letters and the
+# XML style ids (banded: odd rows use STYLE_A, even STYLE_B, as in rows 7/8).
+COLUMNS = ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "M"]
+STYLE_A = {"B": "17", "C": "19", "D": "18", "E": "19", "F": "19",
+           "G": "20", "H": "19", "I": "37", "J": "18", "K": "50", "M": "37"}
+STYLE_B = {"B": "21", "C": "23", "D": "22", "E": "23", "F": "15",
+           "G": "24", "H": "23", "I": "22", "J": "22", "K": "51", "M": "22"}
 
 
 # --------------------------------------------------------------------------
 # minutes .docx parsing
 # --------------------------------------------------------------------------
 def _blocks(document):
+    from docx.table import Table
     for child in document.element.body.iterchildren():
-        if child.tag == qn("w:p"):
-            pass
-        elif child.tag == qn("w:tbl"):
-            from docx.table import Table
+        if child.tag == qn("w:tbl"):
             yield Table(child, document)
 
 
@@ -52,8 +69,12 @@ def _rows(table):
     return [[c.text.strip() for c in row.cells] for row in table.rows]
 
 
-def parse_minutes(path):
-    """Return list of action dicts parsed from one minutes .docx."""
+def parse_minutes(path, owners=None):
+    """Return list of action dicts parsed from one minutes .docx.
+
+    owners: optional dict mapping a responsible-department substring -> is-hawaz
+    owner name, used to fill 'المسؤول من الفريق' when no name appears inline.
+    """
     doc = docx.Document(path)
     tables = list(_blocks(doc))
 
@@ -63,9 +84,9 @@ def parse_minutes(path):
             if "عنوان الاجتماع" in row:
                 title = next((c for c in row if c and c != "عنوان الاجتماع"), "")
             if "التاريخ" in row:
-                i = row.index("التاريخ")
-                if i - 1 >= 0:
-                    date = row[i - 1]
+                idx = row.index("التاريخ")
+                if idx - 1 >= 0:
+                    date = row[idx - 1]
 
     team_names = []
     for tb in tables:
@@ -78,7 +99,6 @@ def parse_minutes(path):
     actions = []
     for tb in tables:
         data = _rows(tb)
-        # locate actions header: a row containing both المهمة and المسؤول
         hdr = next((i for i, r in enumerate(data)
                     if "المهمة" in r and "المسؤول" in r), None)
         if hdr is None:
@@ -86,7 +106,7 @@ def parse_minutes(path):
         head = data[hdr]
         ti = next((i for i, c in enumerate(head) if "المهمة" in c), None)
         ri = next((i for i, c in enumerate(head) if "المسؤول" in c), None)
-        di = next((i for i, c in enumerate(head) if any(m in c for m in DUE_MARKERS)), None)
+        di = next((i for i, c in enumerate(head) if "انتهاء" in c), None)
         ni = next((i for i, c in enumerate(head) if "ملاحظات" in c), None)
 
         for row in data[hdr + 1:]:
@@ -103,110 +123,127 @@ def parse_minutes(path):
                 "responsible": resp,
                 "due": due,
                 "notes": notes,
-                "team_owner": _match_owner(team_names, task, notes, resp),
+                "team_owner": _match_owner(team_names, owners, task, notes, resp),
                 "source": f"{title} — {date}" if (title and date) else title or date,
             })
     return actions
 
 
-def _match_owner(team_names, task, notes, responsible):
-    """Deterministic best-effort: find a is-hawaz member name in the text."""
+def _match_owner(team_names, owners, task, notes, responsible):
+    """Deterministic best-effort attribution of the is-hawaz owner.
+
+    Priority: a team member's first name found inline -> an --owners mapping hit
+    (by responsible-department substring) -> "" (blank for a human to fill).
+    """
     hay = f"{task} {notes} {responsible}"
     for name in team_names:
         first = name.split()[0] if name.split() else name
         if first and first in hay:
             return name
+    if owners:
+        for key, owner in owners.items():
+            if key and key in responsible:
+                return owner
     return ""
 
 
 # --------------------------------------------------------------------------
-# fill tracker xlsx
+# surgical xlsx fill (preserves table + dropdowns + styling)
 # --------------------------------------------------------------------------
-HEADER_MAP = {
-    "المسؤول من الفريق": "team_owner",
-    "المهمة": "task",
-    "المسؤول": "responsible",
-    "الحالة": "_status",
-    "تاريخ التسليم المستهدف": "due",
-    "الاجتماع / المصدر": "source",
-    "ملاحظات": "notes",
-    "تاريخ المستهدف وفق المحضر": "due",
-    "آخر تحديث": "_updated",
-}
+def _xml_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def find_header_row(ws):
-    """Return (row_idx, {header_label: col_idx}, num_col) of the actions header row.
+def _cell(letter, row, style, value):
+    ref = f"{letter}{row}"
+    if value in ("", None):
+        return f'<c r="{ref}" s="{style}"/>'
+    v = _xml_escape(str(value))
+    return (f'<c r="{ref}" s="{style}" t="inlineStr">'
+            f'<is><t xml:space="preserve">{v}</t></is></c>')
 
-    num_col is the column of the '#' / 'رقم' sequence field, or None.
+
+def fill_tracker(tracker_path, actions, out=None, status=DEFAULT_STATUS, owners=None):
+    """Append actions rows to the tracker via surgical XML edit.
+
+    Returns (written, dest_path).
     """
-    for r in range(1, min(ws.max_row, 15) + 1):
-        labels = {}
-        num_col = None
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(row=r, column=c).value
-            if isinstance(v, str):
-                v = v.strip().rstrip()
-                if v in HEADER_MAP:
-                    labels[v] = c
-                elif v in ("#", "رقم", "رقم المهمة"):
-                    num_col = c
-        if "المهمة" in labels and "المسؤول" in labels:
-            return r, labels, num_col
-    return None, None, None
+    # (owners mapping is applied during parsing; passed here only for the CLI run)
+    sheet_path = "xl/worksheets/sheet1.xml"
+    table_path = "xl/tables/table1.xml"
+    with zipfile.ZipFile(tracker_path) as z:
+        sheet = z.read(sheet_path).decode("utf-8")
+        table = z.read(table_path).decode("utf-8")
 
+    # existing rows -> ordered list of (row_number, raw_xml); matches both
+    # self-closing (<row .../>) and paired (<row ...>...</row>) row elements
+    row_re = re.compile(r"<row\b[^>]*?(?:/>|>.*?</row>)", re.S)
+    existing = []
+    for m in row_re.finditer(sheet):
+        num = int(re.search(r'r="(\d+)"', m.group(0)).group(1))
+        existing.append((num, m.group(0)))
+    existing = dict(existing)  # row_num -> xml (keeps document order)
 
-def build_row(action, seq, status, today):
-    """Map an action onto a full tracker row keyed by header label."""
-    return {
-        "المسؤول من الفريق": action["team_owner"],
-        "المهمة": action["task"],
-        "المسؤول": action["responsible"],
-        "الحالة": status,
-        "تاريخ التسليم المستهدف": action["due"],
-        "الاجتماع / المصدر": action["source"],
-        "ملاحظات": action["notes"],
-        "تاريخ المستهدف وفق المحضر": action["due"],
-        "آخر تحديث": today,
-    }
+    last_orig = max(existing) if existing else 6
+    first = 7                       # row 6 holds the original sample -> start at 7
+    last = first - 1 + len(actions)  # last data row (7 when no actions)
 
-
-def fill_tracker(tracker_path, actions, status=DEFAULT_STATUS, out=None):
-    wb = load_workbook(tracker_path)
-    ws = wb[TRACKER_SHEET]
-    hdr_row, hdr, num_col = find_header_row(ws)
-    if hdr_row is None:
-        raise RuntimeError(f"Could not find actions header row in sheet '{TRACKER_SHEET}'.")
-    if num_col is None:
-        num_col = max(1, hdr["المهمة"] - 2)  # fallback: assume '#' is two cols left
-
-    # find first empty row below the header (rows with no task text)
-    start = hdr_row + 1
-    nxt = start
-    while nxt <= ws.max_row:
-        val = ws.cell(row=nxt, column=hdr["المهمة"]).value
-        if val is None or not str(val).strip():
-            break
-        nxt += 1
-    if nxt > ws.max_row:
-        nxt = ws.max_row + 1
-
-    seq = nxt - hdr_row          # sequence # for the first new row
     today = datetime.date.today().strftime("%d/%m/%Y")
-    written = 0
-    for action in actions:
-        row = build_row(action, seq, status, today)
-        for label, col in hdr.items():
-            ws.cell(row=nxt, column=col).value = row[label]
-        # write the sequence number into the '#' column
-        ws.cell(row=nxt, column=num_col).value = seq
-        nxt += 1
-        seq += 1
-        written += 1
+    generated = {}
+    for i, a in enumerate(actions):
+        r = first + i
+        style = STYLE_A if r % 2 == 1 else STYLE_B
+        values = {
+            "B": str(i + 2),          # continue numbering after the sample row (#1)
+            "C": a["team_owner"],
+            "D": a["task"],
+            "E": a["responsible"],
+            "F": status,              # EMPTY by default
+            "G": a["due"],
+            "H": a["source"],
+            "I": a["notes"],
+            "J": "",
+            "K": "",
+            "M": today,
+        }
+        cells = "".join(_cell(col, r, style[col], values[col]) for col in COLUMNS)
+        generated[r] = f'<row r="{r}" spans="2:13" ht="16.5">{cells}</row>'
+
+    # reassemble sheetData: keep every original row, replacing in-range rows with
+    # generated data, then append any generated rows that exceed the original max
+    parts = []
+    for num, xml in existing.items():
+        if num in generated:
+            parts.append(generated[num])
+        else:
+            parts.append(xml)
+    for num in sorted(k for k in generated if k > last_orig):
+        parts.append(generated[num])
+    sheet_data = "<sheetData>" + "".join(parts) + "</sheetData>"
+    sheet = re.sub(r"<sheetData>.*?</sheetData>",
+                   lambda _m: sheet_data, sheet, count=1, flags=re.S)
+
+    # extend the sheet dimension, the status-dropdown range, and the table range
+    sheet = re.sub(r'<dimension ref="[^"]*"/>', f'<dimension ref="B1:DJ{last}"/>',
+                   sheet, count=1)
+    sheet = re.sub(r"(<xm:sqref>F\d+:F)\d+(</xm:sqref>)",
+                   lambda m: m.group(1) + str(last) + m.group(2), sheet, count=1)
+    table = re.sub(r'ref="B5:M\d+"', f'ref="B5:M{last}"', table)
 
     dest = out or tracker_path
-    wb.save(dest)
-    return written, dest
+    tmp = dest + ".tmp"
+    with zipfile.ZipFile(tracker_path) as zin, \
+         zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == sheet_path:
+                data = sheet.encode("utf-8")
+            elif item.filename == table_path:
+                data = table.encode("utf-8")
+            zout.writestr(item, data)
+    os.replace(tmp, dest)
+    return len(actions), dest
 
 
 # --------------------------------------------------------------------------
@@ -219,12 +256,12 @@ def collect_minutes(minutes_arg):
                 if n.lower().endswith(".docx"):
                     files.append(os.path.join(root, n))
     elif zipfile.is_zipfile(minutes_arg):
-        z = zipfile.ZipFile(minutes_arg)
         import tempfile
         tmp = tempfile.mkdtemp(prefix="minutes_")
-        for name in z.namelist():
-            if name.lower().endswith(".docx"):
-                z.extract(name, tmp)
+        with zipfile.ZipFile(minutes_arg) as z:
+            for name in z.namelist():
+                if name.lower().endswith(".docx"):
+                    z.extract(name, tmp)
         for root, _, names in os.walk(tmp):
             for n in names:
                 if n.lower().endswith(".docx"):
@@ -242,8 +279,15 @@ def main(argv=None):
                     help="Folder or .zip containing minutes .docx files")
     ap.add_argument("--out", default=None, help="Output .xlsx (default: overwrite tracker)")
     ap.add_argument("--status", default=DEFAULT_STATUS,
-                    help="Status to set on new rows (default: 'لم تبدأ')")
+                    help='Status for new rows (default: EMPTY "لم تبدأ" -> no value)')
+    ap.add_argument("--owners", default=OWNERS_FILE,
+                    help="JSON mapping responsible-department -> is-hawaz owner")
     args = ap.parse_args(argv)
+
+    owners = None
+    if args.owners:
+        with open(args.owners, encoding="utf-8") as f:
+            owners = json.load(f)
 
     minutes_files = collect_minutes(args.minutes)
     if not minutes_files:
@@ -251,13 +295,13 @@ def main(argv=None):
 
     all_actions = []
     for f in minutes_files:
-        all_actions.extend(parse_minutes(f))
+        all_actions.extend(parse_minutes(f, owners))
 
     if not all_actions:
         sys.exit("No action items found in any minutes file.")
 
     written, dest = fill_tracker(args.tracker, all_actions,
-                                 status=args.status, out=args.out)
+                                 out=args.out, status=args.status, owners=owners)
     print(f"Parsed {len(minutes_files)} minutes files; "
           f"wrote {written} action rows -> {dest}")
 
